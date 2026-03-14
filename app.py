@@ -85,14 +85,17 @@ def create_vector_store(chunks):
     print(f"Zapisano chunki do bazy ChromaDB")
     return vectorstore
 
+# załaduj raz przy starcie
+print("Ładuję bazę wektorową...")
+embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+vectorstore = Chroma(
+    persist_directory=CHROMA_PATH,
+    embedding_function=embeddings
+)
+print("Baza załadowana!")
+
 def chat(question, history):
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
-    vectorstore = Chroma(
-        persist_directory=CHROMA_PATH,
-        embedding_function=embeddings
-    )
-    
-    results = vectorstore.similarity_search(question, k=3)
+    results = vectorstore.similarity_search(question, k=5)
     
     # debug
     print(f"\n--- Pytanie: {question} ---")
