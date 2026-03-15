@@ -3,6 +3,8 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import Chroma
 import os
+import hashlib
+
 
 DOCS_PATH = r"C:\Users\lukas\rag_doc"
 CHROMA_PATH = r"C:\Users\lukas\rag_projekt\chroma_db"
@@ -57,7 +59,17 @@ def main():
         separators=["\n\n", "\n", ".", " "]
     )
     chunks = splitter.split_documents(new_docs)
-    print(f"Podzielono na {len(chunks)} chunków")
+    
+    # deduplikacja
+    seen = set()
+    unique_chunks = []
+    for chunk in chunks:
+        chunk_hash = hashlib.md5(chunk.page_content.encode('utf-8')).hexdigest()
+        if chunk_hash not in seen:
+            seen.add(chunk_hash)
+            unique_chunks.append(chunk)
+    print(f"Podzielono na {len(unique_chunks)} unikalnych chunków (było {len(chunks)})")
+    chunks = unique_chunks
     
     embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
     vectorstore = Chroma(
