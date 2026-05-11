@@ -1,22 +1,27 @@
 import os
+
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 import torch
+
 torch._dynamo.config.disable = True
 
-import hashlib
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from unsloth import FastLanguageModel
 import gradio as gr
+from unsloth import FastLanguageModel
 
-DOCS_PATH = r"C:\Users\lukas\rag_doc"
-CHROMA_PATH = r"C:\Users\lukas\rag_projekt\chroma_db"
-MODEL_PATH = r"C:\Users\lukas\fine_tuning\zielony_obieg_gemma"
+from rag_utils import (
+    CHROMA_PATH,
+    DOCS_PATH,
+    MODEL_PATH,
+    add_chunks_to_store,
+    chunk_documents,
+    dedupe_chunks,
+    get_embeddings,
+    get_vectorstore,
+    load_documents,
+)
 
-# załaduj LLM raz przy starcie
+
 print("Ładuję fine-tuned model...")
 model, tokenizer = FastLanguageModel.from_pretrained(
     model_name=MODEL_PATH,
@@ -27,23 +32,21 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 FastLanguageModel.for_inference(model)
 print("Model załadowany!")
 
+
 def generate(prompt):
-    system_msg = "Jesteś asystentem firmy ZIELONY OBIEG ŁUKASZ KITA, specjalizującej się w zagospodarowaniu komunalnych osadów ściekowych na cele rolnicze w województwie mazowieckim."
-    
-    messages = [
-        {"role": "user", "content": system_msg + "\n\n" + prompt}
-    ]
+    system_msg = (
+        "Jesteś asystentem firmy ZIELONY OBIEG ŁUKASZ KITA, specjalizującej się "
+        "w zagospodarowaniu komunalnych osadów ściekowych na cele rolnicze "
+        "w województwie mazowieckim."
+    )
+
+    messages = [{"role": "user", "content": system_msg + "\n\n" + prompt}]
     text = tokenizer.apply_chat_template(
-        messages, 
-        tokenize=False, 
-        add_generation_prompt=True
+        messages, tokenize=False, add_generation_prompt=True
     )
     inputs = tokenizer(
-    text,
-    return_tensors="pt",
-    truncation=True,
-    max_length=1900
-).to("cuda")
+        text, return_tensors="pt", truncation=True, max_length=1900
+    ).to("cuda")
     outputs = model.generate(
         **inputs,
         max_new_tokens=256,
@@ -51,46 +54,20 @@ def generate(prompt):
         do_sample=True,
         repetition_penalty=1.2,
     )
-    new_tokens = outputs[0][inputs['input_ids'].shape[1]:]
-    response = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return response
+    new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+    return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
-def load_documents():
-    docs = []
-    for filename in os.listdir(DOCS_PATH):
-        filepath = os.path.join(DOCS_PATH, filename)
-        try:
-            if filename.lower().endswith(".pdf"):
-                loader = PyPDFLoader(filepath)
-                docs.extend(loader.load())
-            elif filename.lower().endswith((".docx", ".doc")):
-                loader = Docx2txtLoader(filepath)
-                docs.extend(loader.load())
-        except Exception as e:
-            print(f"Błąd przy {filename}: {e}")
-    print(f"Załadowano {len(docs)} fragmentów z {DOCS_PATH}")
-    return docs
-
-def chunk_documents(docs):
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=150,
-        separators=["\n\n", "\n", ".", " "]
-    )
-    chunks = splitter.split_documents(docs)
-    print(f"Podzielono na {len(chunks)} chunków")
-    return chunks
 
 def chat(question, history, vectorstore):
     results = vectorstore.similarity_search(question, k=3)
 
-    # debug
+    sources = [os.path.basename(doc.metadata.get("source", "?")) for doc in results]
+
     print(f"\n--- Pytanie: {question} ---")
     for i, doc in enumerate(results):
-        src = doc.metadata.get('source', '?').split('\\')[-1]
-        print(f"  {i+1}. {src}: {doc.page_content[:100]}")
+        print(f"  {i+1}. {sources[i]}: {doc.page_content[:100]}")
 
-    context = "\n\n".join([doc.page_content for doc in results])
+    context = "\n\n".join(doc.page_content for doc in results)
 
     prompt = f"""Na podstawie poniższych dokumentów odpowiedz na pytanie po polsku.
 Jeśli nie znasz odpowiedzi na podstawie dokumentów, powiedz że nie wiesz.
@@ -102,47 +79,44 @@ Pytanie: {question}
 
 Odpowiedź:"""
 
-    return generate(prompt)
+    answer = generate(prompt)
+
+    unique_sources = sorted({s for s in sources if s and s != "?"})
+    if unique_sources:
+        answer += "\n\n**Źródła:**\n" + "\n".join(f"- {s}" for s in unique_sources)
+    return answer
+
+
+def build_vectorstore_from_scratch(embeddings):
+    print("Baza nie istnieje. Buduję nową...")
+    docs, _ = load_documents(DOCS_PATH)
+    print(f"Załadowano {len(docs)} fragmentów z {DOCS_PATH}")
+    chunks = chunk_documents(docs)
+    print(f"Podzielono na {len(chunks)} chunków")
+    unique = dedupe_chunks(chunks)
+    print(f"Po deduplikacji: {len(unique)} unikalnych chunków (było {len(chunks)})")
+
+    vectorstore = get_vectorstore(embeddings)
+    add_chunks_to_store(vectorstore, unique)
+    print("Nowa baza gotowa!")
+    return vectorstore
+
 
 if __name__ == "__main__":
     print("\n--- ETAP 1: INICJALIZACJA BAZY WIEDZY ---")
 
     print("Ładuję model embeddingów (BAAI/bge-m3)...")
-    embeddings = HuggingFaceEmbeddings(model_name="BAAI/bge-m3")
+    embeddings = get_embeddings()
 
     if os.path.exists(CHROMA_PATH) and os.listdir(CHROMA_PATH):
         print(f"Znaleziono istniejącą bazę w {CHROMA_PATH}. Wczytywanie...")
-        active_vectorstore = Chroma(
-            persist_directory=CHROMA_PATH,
-            embedding_function=embeddings
+        active_vectorstore = get_vectorstore(embeddings)
+        print(
+            f"Baza wczytana. Liczba dokumentów: "
+            f"{active_vectorstore._collection.count()}"
         )
-        print(f"Baza wczytana. Liczba dokumentów: {active_vectorstore._collection.count()}")
     else:
-        print("Baza nie istnieje. Buduję nową...")
-        docs = load_documents()
-        chunks = chunk_documents(docs)
-
-        # deduplikacja MD5
-        seen = set()
-        unique_chunks = []
-        for chunk in chunks:
-            chunk_hash = hashlib.md5(chunk.page_content.encode('utf-8')).hexdigest()
-            if chunk_hash not in seen:
-                seen.add(chunk_hash)
-                unique_chunks.append(chunk)
-        print(f"Po deduplikacji: {len(unique_chunks)} unikalnych chunków (było {len(chunks)})")
-
-        active_vectorstore = Chroma(
-            persist_directory=CHROMA_PATH,
-            embedding_function=embeddings
-        )
-        for i, chunk in enumerate(unique_chunks):
-            try:
-                active_vectorstore.add_documents([chunk])
-            except Exception as e:
-                print(f"Pominięto chunk {i}: {e}")
-
-        print("Nowa baza gotowa!")
+        active_vectorstore = build_vectorstore_from_scratch(embeddings)
 
     print("\n--- ETAP 2: URUCHAMIANIE INTERFEJSU ---")
 
